@@ -68,19 +68,7 @@ function createPrisma7TxClient(): PrismaClientLike {
   return txClient;
 }
 
-// ===========================================================================
-// Tests — concurrent nested transactions (the epic fix)
-//
-// Prisma 7 blocks concurrent nested $transaction() on the same client.
-// jest-prisma wraps each test in a transaction, so all app $transaction()
-// calls become nested. The RolloCategoryRepositoryDecorator pattern —
-// write UoW calling a read UoW concurrently — triggers this.
-//
-// The fix: never delegate to txClient.$transaction(); always pass
-// parentTxClient directly (passthrough).
-// ===========================================================================
-
-describe("concurrent nested transactions (epic fix)", () => {
+describe("concurrent nested transactions", () => {
   let mockClient: MockPrismaClient;
   let delegate: PrismaEnvironmentDelegate;
 
@@ -128,7 +116,7 @@ describe("concurrent nested transactions (epic fix)", () => {
     expect(mockClient._lastTxClient!.$transaction).not.toHaveBeenCalled();
   });
 
-  it("write UoW + concurrent read UoW succeeds (the epic pattern)", async () => {
+  it("write UoW + concurrent read UoW succeeds", async () => {
     const proxy = delegate.getClient()!;
 
     const result = await proxy.$transaction(async (writeTx) => {
