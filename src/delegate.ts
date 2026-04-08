@@ -281,13 +281,19 @@ function fakeInnerTransactionFactory(
       }
     } else {
       // --- Interactive (callback) transaction ----------------------------
-      if (parentTxClient.$transaction) {
-        // Prisma 7.5.0+ handles nested transactions natively with savepoints
-        return await parentTxClient.$transaction(
-          arg as (client: PrismaClientLike) => Promise<unknown>,
-        );
-      }
-      // Fallback for Prisma < 7.5.0: use manual savepoint management
+      //
+      // Upstream delegates to `parentTxClient.$transaction(arg)` when
+      // Prisma 7.5+ exposes `$transaction` on the tx client.  This uses
+      // native SAVEPOINTs — but Prisma 7 blocks **concurrent** nested
+      // transactions on the same client, causing "Concurrent nested
+      // transactions are not supported" errors when application code opens
+      // multiple $transaction() calls concurrently (e.g. a write UoW
+      // whose callback triggers a separate read UoW).
+      //
+      // Instead, always pass `parentTxClient` directly to the callback.
+      // All queries execute on the same connection within the root test
+      // transaction, matching pre-Prisma-7 behaviour.
+      //
       try {
         const result = await (arg as (client: PrismaClientLike) => Promise<unknown>)(parentTxClient);
         if (enableExperimentalRollbackInTransaction) {
