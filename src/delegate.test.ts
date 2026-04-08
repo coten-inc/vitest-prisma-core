@@ -6,11 +6,14 @@ import type { PrismaClientLike } from "./types";
 // Mock PrismaClient — simulates Prisma 7.5+ interactive transactions
 // ---------------------------------------------------------------------------
 
-function createMockPrismaClient(): PrismaClientLike & {
-  _activeTransaction: boolean;
-} {
-  const client: PrismaClientLike & { _activeTransaction: boolean } = {
-    _activeTransaction: false,
+interface MockPrismaClient extends PrismaClientLike {
+  /** The txClient created during the most recent $transaction call */
+  _lastTxClient: PrismaClientLike | null;
+}
+
+function createMockPrismaClient(): MockPrismaClient {
+  const client: MockPrismaClient = {
+    _lastTxClient: null,
     $connect: vi.fn(async () => {}),
     $disconnect: vi.fn(async () => {}),
     $on: vi.fn(),
@@ -19,7 +22,8 @@ function createMockPrismaClient(): PrismaClientLike & {
       if (typeof fn === "function") {
         // Simulate interactive transaction — create a "tx client" that
         // also exposes $transaction (like Prisma 7.5+)
-        const txClient = createTxClient(client);
+        const txClient = createPrisma7TxClient();
+        client._lastTxClient = txClient;
         return await (fn as (tx: PrismaClientLike) => Promise<unknown>)(
           txClient,
         );
@@ -36,31 +40,47 @@ function createMockPrismaClient(): PrismaClientLike & {
 }
 
 /**
- * Create a mock tx client that simulates Prisma 7.5+ behaviour:
- * - Has $transaction (native nested SAVEPOINTs)
- * - Has $executeRawUnsafe
- * - Has model-like methods (user, post)
+ * Create a mock tx client that faithfully simulates Prisma 7.5+ behaviour:
+ *
+ * - Exposes `$transaction` (native nested SAVEPOINTs)
+ * - **Blocks concurrent nested transactions** — if a nested tx callback is
+ *   already executing, a second `$transaction()` call throws
+ *   "Concurrent nested transactions are not supported", exactly like
+ *   Prisma 7.
+ *
+ * This lets us prove that the fork's passthrough approach avoids the
+ * blocking, while the upstream delegation path would fail.
  */
-function createTxClient(
-  _rootClient: PrismaClientLike,
-): PrismaClientLike {
+function createPrisma7TxClient(): PrismaClientLike {
+  let hasActiveNestedTx = false;
+
   const txClient: PrismaClientLike = {
     $connect: vi.fn(async () => {}),
     $disconnect: vi.fn(async () => {}),
     $on: vi.fn(),
     $executeRawUnsafe: vi.fn(async () => 0),
-    // Prisma 7.5+ exposes $transaction on tx clients
+    // Prisma 7.5+ exposes $transaction on tx clients — but blocks concurrency
     $transaction: vi.fn(async (fn: unknown) => {
-      if (typeof fn === "function") {
-        return await (fn as (tx: PrismaClientLike) => Promise<unknown>)(
-          txClient,
+      if (hasActiveNestedTx) {
+        throw new Error(
+          "Concurrent nested transactions are not supported",
         );
       }
-      const results: unknown[] = [];
-      for (const p of fn as unknown[]) {
-        results.push(await p);
+      hasActiveNestedTx = true;
+      try {
+        if (typeof fn === "function") {
+          return await (fn as (tx: PrismaClientLike) => Promise<unknown>)(
+            txClient,
+          );
+        }
+        const results: unknown[] = [];
+        for (const p of fn as unknown[]) {
+          results.push(await p);
+        }
+        return results;
+      } finally {
+        hasActiveNestedTx = false;
       }
-      return results;
     }),
   };
 
@@ -124,7 +144,7 @@ async function withTestLifecycle(
 // ===========================================================================
 
 describe("PrismaEnvironmentDelegate", () => {
-  let mockClient: ReturnType<typeof createMockPrismaClient>;
+  let mockClient: MockPrismaClient;
   let delegate: PrismaEnvironmentDelegate;
   let jestPrisma: Awaited<ReturnType<typeof delegate.preSetup>>;
 
@@ -186,26 +206,17 @@ describe("PrismaEnvironmentDelegate", () => {
       });
     });
 
-    it("does NOT call parentTxClient.$transaction (no native nesting)", async () => {
+    it("never calls txClient.$transaction for interactive transactions", async () => {
       await withTestLifecycle(delegate, async () => {
         const client = delegate.getClient()!;
 
-        // Get the txClient that was created inside beginTransaction
-        // We can't access it directly, but we can track $transaction calls
-        // on the mock. The root client's $transaction is called once for
-        // beginTransaction. The txClient's $transaction should NOT be called.
-        const rootTxCallsBefore = (
-          mockClient.$transaction as ReturnType<typeof vi.fn>
-        ).mock.calls.length;
-
         await client.$transaction(async () => "result");
 
-        const rootTxCallsAfter = (
-          mockClient.$transaction as ReturnType<typeof vi.fn>
-        ).mock.calls.length;
-
-        // No additional $transaction calls on the root client
-        expect(rootTxCallsAfter).toBe(rootTxCallsBefore);
+        // The txClient created inside beginTransaction should NOT have
+        // had its $transaction called — the fake method passes
+        // parentTxClient directly instead of delegating to native nesting.
+        const txClient = mockClient._lastTxClient!;
+        expect(txClient.$transaction).not.toHaveBeenCalled();
       });
     });
 
@@ -231,22 +242,65 @@ describe("PrismaEnvironmentDelegate", () => {
     });
   });
 
-  describe("concurrent interactive transactions (the key fix)", () => {
-    it("allows concurrent $transaction calls without errors", async () => {
-      await withTestLifecycle(delegate, async () => {
-        const client = delegate.getClient()!;
+  // =========================================================================
+  // The epic scenario: concurrent nested transactions
+  //
+  // This is the primary reason this fork exists. Prisma 7 blocks concurrent
+  // nested $transaction() calls on the same client. The mock txClient
+  // faithfully simulates this: calling txClient.$transaction() while another
+  // is active throws "Concurrent nested transactions are not supported".
+  //
+  // The fork avoids this by never calling txClient.$transaction() — it
+  // passes parentTxClient directly to callbacks instead.
+  // =========================================================================
 
-        // Simulate the pattern:
-        //   write UoW starts $transaction
-        //     → inside, decorator starts another $transaction concurrently
-        const writeResult = await client.$transaction(async (tx) => {
-          // Simulate a write
+  describe("concurrent nested transactions (epic fix)", () => {
+    it("the mock txClient itself blocks concurrent nested calls (Prisma 7 behaviour)", async () => {
+      // Prove the mock is realistic: calling txClient.$transaction
+      // concurrently throws, just like Prisma 7 would.
+      await withTestLifecycle(delegate, async () => {
+        const txClient = mockClient._lastTxClient!;
+
+        await expect(
+          txClient.$transaction(async () => {
+            // While this outer callback is running, start another
+            return await txClient.$transaction(async () => "inner");
+          }),
+        ).rejects.toThrow("Concurrent nested transactions are not supported");
+      });
+    });
+
+    it("proxy never calls txClient.$transaction, even with concurrent nested use", async () => {
+      // The exact pattern from the epic: write UoW opens $transaction,
+      // inside it the RolloCategoryRepositoryDecorator opens a concurrent
+      // $transaction for reading.
+      await withTestLifecycle(delegate, async () => {
+        const proxy = delegate.getClient()!;
+
+        await proxy.$transaction(async () => {
+          // Concurrent nested call — would fail if native delegation
+          // were used, but passthrough avoids it
+          await proxy.$transaction(async () => "read-uow");
+          return "write-uow";
+        });
+
+        const txClient = mockClient._lastTxClient!;
+        expect(txClient.$transaction).not.toHaveBeenCalled();
+      });
+    });
+
+    it("write UoW + read UoW pattern succeeds with correct results", async () => {
+      await withTestLifecycle(delegate, async () => {
+        const proxy = delegate.getClient()!;
+
+        // Simulate: write UoW starts, calls decorator, decorator opens
+        // read UoW concurrently
+        const writeResult = await proxy.$transaction(async (writeTx) => {
           const writeData = { written: true };
 
-          // Concurrently, the decorator opens a read transaction
-          const readResult = await client.$transaction(async (readTx) => {
-            // readTx should be the same parentTxClient
-            expect(readTx).toBe(tx);
+          const readResult = await proxy.$transaction(async (readTx) => {
+            // Both should receive the same parentTxClient (passthrough)
+            expect(readTx).toBe(writeTx);
             return { readData: "from-rollo" };
           });
 
@@ -260,19 +314,23 @@ describe("PrismaEnvironmentDelegate", () => {
       });
     });
 
-    it("allows deeply nested concurrent transactions", async () => {
+    it("deeply nested concurrent transactions all succeed", async () => {
       await withTestLifecycle(delegate, async () => {
-        const client = delegate.getClient()!;
+        const proxy = delegate.getClient()!;
 
-        const result = await client.$transaction(async () => {
-          const a = await client.$transaction(async () => {
-            const b = await client.$transaction(async () => "deep");
+        const result = await proxy.$transaction(async () => {
+          const a = await proxy.$transaction(async () => {
+            const b = await proxy.$transaction(async () => "deep");
             return `${b}-nested`;
           });
           return `${a}-done`;
         });
 
         expect(result).toBe("deep-nested-done");
+
+        // None of these went through native nesting
+        const txClient = mockClient._lastTxClient!;
+        expect(txClient.$transaction).not.toHaveBeenCalled();
       });
     });
   });
