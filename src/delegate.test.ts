@@ -1,0 +1,138 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { PrismaEnvironmentDelegate } from "./delegate";
+import type { PrismaClientLike } from "./types";
+
+// ---------------------------------------------------------------------------
+// Mock PrismaClient — simulates Prisma 7.5+ with concurrent nesting block
+// ---------------------------------------------------------------------------
+
+interface MockPrismaClient extends PrismaClientLike {
+  _lastTxClient: PrismaClientLike | null;
+}
+
+function createMockPrismaClient(): MockPrismaClient {
+  const client: MockPrismaClient = {
+    _lastTxClient: null,
+    $connect: vi.fn(async () => {}),
+    $disconnect: vi.fn(async () => {}),
+    $on: vi.fn(),
+    $executeRawUnsafe: vi.fn(async () => 0),
+    $transaction: vi.fn(async (fn: unknown, _options?: unknown) => {
+      if (typeof fn === "function") {
+        const txClient = createPrisma7TxClient();
+        client._lastTxClient = txClient;
+        return await (fn as (tx: PrismaClientLike) => Promise<unknown>)(
+          txClient,
+        );
+      }
+      const results: unknown[] = [];
+      for (const p of fn as unknown[]) {
+        results.push(await p);
+      }
+      return results;
+    }),
+  };
+  return client;
+}
+
+/**
+ * Simulates Prisma 7.5+ tx client: exposes `$transaction` but blocks
+ * concurrent nested calls, exactly like Prisma 7.
+ */
+function createPrisma7TxClient(): PrismaClientLike {
+  let hasActiveNestedTx = false;
+
+  const txClient: PrismaClientLike = {
+    $connect: vi.fn(async () => {}),
+    $disconnect: vi.fn(async () => {}),
+    $on: vi.fn(),
+    $executeRawUnsafe: vi.fn(async () => 0),
+    $transaction: vi.fn(async (fn: unknown) => {
+      if (hasActiveNestedTx) {
+        throw new Error(
+          "Concurrent nested transactions are not supported",
+        );
+      }
+      hasActiveNestedTx = true;
+      try {
+        if (typeof fn === "function") {
+          return await (fn as (tx: PrismaClientLike) => Promise<unknown>)(
+            txClient,
+          );
+        }
+      } finally {
+        hasActiveNestedTx = false;
+      }
+    }),
+  };
+  return txClient;
+}
+
+describe("concurrent nested transactions", () => {
+  let mockClient: MockPrismaClient;
+  let delegate: PrismaEnvironmentDelegate;
+
+  beforeEach(async () => {
+    mockClient = createMockPrismaClient();
+    delegate = new PrismaEnvironmentDelegate(
+      {
+        projectConfig: { testEnvironmentOptions: {} as never },
+        globalConfig: { rootDir: "" },
+      },
+      { testPath: "test/example.test.ts" },
+    );
+    const jestPrisma = await delegate.preSetup();
+    jestPrisma.initializeClient(mockClient);
+
+    const test = { name: "test", parent: null };
+    await delegate.handleTestEvent({ name: "test_start", test });
+    await delegate.handleTestEvent({ name: "test_fn_start", test });
+  });
+
+  afterEach(async () => {
+    const test = { name: "test", parent: null };
+    await delegate.handleTestEvent({ name: "test_done", test });
+    await delegate.handleTestEvent({ name: "test_fn_success", test });
+  });
+
+  it("mock txClient blocks concurrent nested calls (Prisma 7 behaviour)", async () => {
+    const txClient = mockClient._lastTxClient!;
+
+    await expect(
+      txClient.$transaction(async () => {
+        return await txClient.$transaction(async () => "inner");
+      }),
+    ).rejects.toThrow("Concurrent nested transactions are not supported");
+  });
+
+  it("proxy bypasses txClient.$transaction — no native nesting", async () => {
+    const proxy = delegate.getClient()!;
+
+    await proxy.$transaction(async () => {
+      await proxy.$transaction(async () => "read-uow");
+      return "write-uow";
+    });
+
+    expect(mockClient._lastTxClient!.$transaction).not.toHaveBeenCalled();
+  });
+
+  it("write UoW + concurrent read UoW succeeds", async () => {
+    const proxy = delegate.getClient()!;
+
+    const result = await proxy.$transaction(async (writeTx) => {
+      const writeData = { written: true };
+
+      // RolloCategoryRepositoryDecorator opens a read UoW concurrently
+      const readResult = await proxy.$transaction(async (readTx) => {
+        // Both receive the same parentTxClient (passthrough)
+        expect(readTx).toBe(writeTx);
+        return { readData: "from-rollo" };
+      });
+
+      return { ...writeData, ...readResult };
+    });
+
+    expect(result).toEqual({ written: true, readData: "from-rollo" });
+    expect(mockClient._lastTxClient!.$transaction).not.toHaveBeenCalled();
+  });
+});
